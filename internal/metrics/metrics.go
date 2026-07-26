@@ -167,6 +167,7 @@ func (r *Registry) Snapshot() Status {
 		TUNReadErrors:   r.TUNReadErrors.Load(),
 		TUNWriteErrors:  r.TUNWriteErrors.Load(),
 		ActiveSessions:  r.ActiveSessions.Load(),
+		Paths:           make([]PathStatus, 0, len(r.paths)),
 	}
 	if r.control != nil && r.control.State != nil {
 		controlStatus := r.control.State()

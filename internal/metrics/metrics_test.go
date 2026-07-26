@@ -46,6 +46,21 @@ func TestDashboardStatusAndPrometheusEndpoints(t *testing.T) {
 	}
 }
 
+func TestEmptyStatusUsesJSONArrays(t *testing.T) {
+	registry := New("client")
+	status := registry.Snapshot()
+	if status.Paths == nil {
+		t.Fatal("empty path telemetry must be an array, not null")
+	}
+	encoded, err := json.Marshal(status)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(encoded), `"paths":[]`) {
+		t.Fatalf("empty paths were not encoded as an array: %s", encoded)
+	}
+}
+
 func TestControlRequiresCapabilityToken(t *testing.T) {
 	registry := New("client")
 	var starts atomic.Int32

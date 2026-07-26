@@ -38,7 +38,7 @@ table{width:100%;border-collapse:collapse}th{text-align:left;color:var(--muted);
 const $=id=>document.getElementById(id),history=[],maxPoints=90,controlToken='__CONTROL_TOKEN__';let previous=null,previousAt=0,busy=false;
 const fmtBytes=n=>{const u=['B','KB','MB','GB','TB'];let i=0;while(n>=1000&&i<u.length-1){n/=1000;i++}return n.toFixed(i?1:0)+' '+u[i]};
 const fmtRate=n=>(n*8/1e6).toFixed(2);
-function render(s,now){const elapsed=previous?Math.max((now-previousAt)/1000,.001):1,up=previous?(s.sent_bytes-previous.sent_bytes)/elapsed:0,down=previous?(s.received_bytes-previous.received_bytes)/elapsed:0;
+function render(s,now){s.paths=Array.isArray(s.paths)?s.paths:[];const elapsed=previous?Math.max((now-previousAt)/1000,.001):1,up=previous?(s.sent_bytes-previous.sent_bytes)/elapsed:0,down=previous?(s.received_bytes-previous.received_bytes)/elapsed:0;
  $('up').innerHTML=fmtRate(up)+'<span class="unit">Mbps</span>';$('down').innerHTML=fmtRate(down)+'<span class="unit">Mbps</span>';
  const healthy=s.paths.filter(p=>p.healthy).length;$('paths').textContent=healthy+' / '+s.paths.length;$('total').textContent=fmtBytes(s.sent_bytes+s.received_bytes);$('role').textContent=s.role.toUpperCase();
  $('auth').textContent=s.auth_failures;$('drops').textContent=s.no_path_drops;$('reorder').textContent=s.reorder_skips;$('invalid').textContent=s.invalid_packets;$('tunerr').textContent=s.tun_read_errors+s.tun_write_errors;$('sessions').textContent=s.active_sessions;
