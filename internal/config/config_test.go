@@ -1,10 +1,12 @@
 package config
 
 import (
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoadClientStrictAndDefaults(t *testing.T) {
@@ -50,6 +52,34 @@ func TestServerRejectsKeyReuseAndOutOfSubnetIP(t *testing.T) {
 	err := server.Validate()
 	if err == nil || (!strings.Contains(err.Error(), "reuses") && !strings.Contains(err.Error(), "usable address")) {
 		t.Fatalf("unexpected validation result: %v", err)
+	}
+}
+
+func TestManagementValidationAndSecrets(t *testing.T) {
+	management := Management{
+		Listen:        "127.0.0.1:8443",
+		DatabasePath:  filepath.Join(t.TempDir(), "control.db"),
+		PublicRelay:   "127.0.0.1:4430",
+		TunnelPool:    "10.77.0.0/24",
+		AdminTokenEnv: "TEST_ADMIN_TOKEN",
+		MasterKeyEnv:  "TEST_MASTER_KEY",
+		ActivationTTL: Duration(15 * time.Minute),
+	}
+	if err := management.Validate(netip.MustParsePrefix("10.77.0.1/24")); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TEST_ADMIN_TOKEN", strings.Repeat("a", 32))
+	t.Setenv("TEST_MASTER_KEY", "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=")
+	token, key, err := management.Secrets()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(token) != 32 || len(key) != 32 {
+		t.Fatalf("unexpected secret lengths: %d %d", len(token), len(key))
+	}
+	management.Listen = "0.0.0.0:8443"
+	if err := management.Validate(netip.MustParsePrefix("10.77.0.1/24")); err == nil {
+		t.Fatal("non-loopback management listener was accepted")
 	}
 }
 

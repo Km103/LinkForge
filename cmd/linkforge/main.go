@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"math"
 	"net"
+	"net/netip"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -18,14 +19,15 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/linkforge/linkforge/internal/clientapp"
-	"github.com/linkforge/linkforge/internal/config"
-	"github.com/linkforge/linkforge/internal/engine"
-	"github.com/linkforge/linkforge/internal/logging"
-	"github.com/linkforge/linkforge/internal/metrics"
-	"github.com/linkforge/linkforge/internal/netconfig"
-	"github.com/linkforge/linkforge/internal/protocol"
-	"github.com/linkforge/linkforge/internal/tun"
+	"github.com/Km103/LinkForge/internal/clientapp"
+	"github.com/Km103/LinkForge/internal/config"
+	"github.com/Km103/LinkForge/internal/controlplane"
+	"github.com/Km103/LinkForge/internal/engine"
+	"github.com/Km103/LinkForge/internal/logging"
+	"github.com/Km103/LinkForge/internal/metrics"
+	"github.com/Km103/LinkForge/internal/netconfig"
+	"github.com/Km103/LinkForge/internal/protocol"
+	"github.com/Km103/LinkForge/internal/tun"
 )
 
 var (
@@ -55,6 +57,8 @@ func run(args []string, stdout, stderr io.Writer) error {
 		return runServer(args[1:], stderr)
 	case "doctor":
 		return runDoctor(args[1:], stdout, stderr)
+	case "enroll":
+		return runEnroll(args[1:], stdout, stderr)
 	case "interfaces":
 		return listInterfaces(stdout)
 	case "keygen":
@@ -190,6 +194,27 @@ func runServer(args []string, stderr io.Writer) error {
 		return err
 	}
 	logger := logging.New(c.Logging, stderr)
+	var controlStore *controlplane.Store
+	var adminToken string
+	if c.Management != nil {
+		token, masterKey, err := c.Management.Secrets()
+		if err != nil {
+			return err
+		}
+		adminToken = token
+		pool, _ := netip.ParsePrefix(c.Management.TunnelPool)
+		serverPrefix, _ := netip.ParsePrefix(c.TunnelAddress)
+		reserved := []netip.Addr{serverPrefix.Addr()}
+		for _, credential := range c.Clients {
+			prefix, _ := netip.ParsePrefix(credential.TunnelAddress)
+			reserved = append(reserved, prefix.Addr())
+		}
+		controlStore, err = controlplane.OpenStore(c.Management.DatabasePath, masterKey, pool, reserved)
+		if err != nil {
+			return err
+		}
+		defer controlStore.Close()
+	}
 	device, err := tun.Open(c.TunnelName, c.MTU)
 	if err != nil {
 		return privilegeHint(err)
@@ -213,8 +238,71 @@ func runServer(args []string, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
+	applications := []func(context.Context) error{server.Run}
+	if c.Management != nil {
+		server.SetClientSeenHook(func(clientID string) {
+			if err := controlStore.Touch(clientID, time.Now()); err != nil {
+				logger.Warn("update managed device last_seen failed", "client_id", clientID, "error", err)
+			}
+		})
+		controlService, err := controlplane.NewService(*c.Management, controlStore, adminToken, controlplane.Hooks{
+			Authorize: server.AuthorizeClient,
+			Revoke:    server.RevokeClient,
+		}, logger)
+		if err != nil {
+			return err
+		}
+		if err := controlService.LoadCredentials(); err != nil {
+			return err
+		}
+		applications = append(applications, controlService.Run)
+	}
 	cleanup = false // engine owns the device
-	return runServices(ctx, stop, c.Metrics.Listen, registry, logger, server.Run)
+	return runServices(ctx, stop, c.Metrics.Listen, registry, logger, applications...)
+}
+
+func runEnroll(args []string, stdout, stderr io.Writer) error {
+	flags := flag.NewFlagSet("enroll", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	baseURL := flags.String("url", "", "HTTPS managed enrollment service URL")
+	code := flags.String("code", "", "one-time activation code (prefer -code-env)")
+	codeEnv := flags.String("code-env", "LINKFORGE_ACTIVATION_CODE", "environment variable containing the activation code")
+	output := flags.String("output", "profile.json", "protected profile output path")
+	deviceName := flags.String("device-name", "", "device label shown to the account owner")
+	force := flags.Bool("force", false, "replace an existing output profile")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	activationCode := *code
+	if activationCode == "" && *codeEnv != "" {
+		activationCode = os.Getenv(*codeEnv)
+	}
+	if *deviceName == "" {
+		hostname, err := os.Hostname()
+		if err != nil {
+			return err
+		}
+		*deviceName = hostname
+	}
+	if err := controlplane.PrepareProfilePath(*output, *force); err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	profile, err := controlplane.FetchProfile(ctx, *baseURL, activationCode, *deviceName, controlplane.CurrentPlatform())
+	if err != nil {
+		return err
+	}
+	if err := controlplane.WriteProfile(*output, profile, *force); err != nil {
+		return err
+	}
+	return json.NewEncoder(stdout).Encode(map[string]string{
+		"status":         "enrolled",
+		"client_id":      profile.ClientID,
+		"tunnel_address": profile.TunnelAddress,
+		"server":         profile.Server,
+		"profile":        *output,
+	})
 }
 
 func runDoctor(args []string, stdout, stderr io.Writer) error {
@@ -329,13 +417,16 @@ func runServices(
 	metricsListen string,
 	registry *metrics.Registry,
 	logger *slog.Logger,
-	application func(context.Context) error,
+	applications ...func(context.Context) error,
 ) error {
 	ctx, stop := context.WithCancel(parent)
 	defer stop()
-	errCh := make(chan error, 2)
-	go func() { errCh <- application(ctx) }()
-	serviceCount := 1
+	errCh := make(chan error, len(applications)+1)
+	for _, application := range applications {
+		application := application
+		go func() { errCh <- application(ctx) }()
+	}
+	serviceCount := len(applications)
 	if metricsListen != "" {
 		serviceCount++
 		go func() { errCh <- metrics.Serve(ctx, metricsListen, registry, logger) }()
@@ -417,6 +508,7 @@ Usage:
   linkforge server     -config server.json
   linkforge client     -config client.json
   linkforge doctor     -config client.json [-duration 5s]
+  linkforge enroll     -url https://SERVICE -code-env LINKFORGE_ACTIVATION_CODE
   linkforge interfaces
   linkforge keygen
   linkforge version

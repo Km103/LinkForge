@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/linkforge/linkforge/internal/protocol"
+	"github.com/Km103/LinkForge/internal/protocol"
 )
 
 const (
@@ -93,6 +93,16 @@ type ClientCredential struct {
 	TunnelAddress string `json:"tunnel_address"`
 }
 
+type Management struct {
+	Listen        string   `json:"listen"`
+	DatabasePath  string   `json:"database_path"`
+	PublicRelay   string   `json:"public_relay"`
+	TunnelPool    string   `json:"tunnel_pool"`
+	AdminTokenEnv string   `json:"admin_token_env"`
+	MasterKeyEnv  string   `json:"master_key_env"`
+	ActivationTTL Duration `json:"activation_ttl"`
+}
+
 type Server struct {
 	Listen             string             `json:"listen"`
 	TunnelName         string             `json:"tunnel_name"`
@@ -106,6 +116,7 @@ type Server struct {
 	StatsInterval      Duration           `json:"stats_interval"`
 	Logging            Logging            `json:"logging"`
 	Metrics            Metrics            `json:"metrics"`
+	Management         *Management        `json:"management,omitempty"`
 }
 
 // Duration accepts Go duration strings in JSON while keeping config readable.
@@ -280,6 +291,28 @@ func (s *Server) defaults() {
 	if s.ReorderWindow == 0 {
 		s.ReorderWindow = 512
 	}
+	if s.Management != nil {
+		if s.Management.Listen == "" {
+			s.Management.Listen = "127.0.0.1:8443"
+		}
+		if s.Management.DatabasePath == "" {
+			s.Management.DatabasePath = "/var/lib/linkforge/control.db"
+		}
+		if s.Management.TunnelPool == "" {
+			if prefix, err := netip.ParsePrefix(s.TunnelAddress); err == nil {
+				s.Management.TunnelPool = prefix.Masked().String()
+			}
+		}
+		if s.Management.AdminTokenEnv == "" {
+			s.Management.AdminTokenEnv = "LINKFORGE_ADMIN_TOKEN"
+		}
+		if s.Management.MasterKeyEnv == "" {
+			s.Management.MasterKeyEnv = "LINKFORGE_CONTROL_MASTER_KEY"
+		}
+		if s.Management.ActivationTTL == 0 {
+			s.Management.ActivationTTL = Duration(15 * time.Minute)
+		}
+	}
 }
 
 func (s Server) Validate() error {
@@ -289,7 +322,7 @@ func (s Server) Validate() error {
 	if err := validateTunnel(s.TunnelAddress, s.MTU); err != nil {
 		return err
 	}
-	if len(s.Clients) == 0 {
+	if len(s.Clients) == 0 && s.Management == nil {
 		return errors.New("at least one server client credential is required")
 	}
 	if s.ReorderWindow < 16 || s.ReorderWindow > 65536 {
@@ -341,7 +374,64 @@ func (s Server) Validate() error {
 		}
 		ips[prefix.Addr()] = struct{}{}
 	}
+	if s.Management != nil {
+		if err := s.Management.Validate(serverPrefix); err != nil {
+			return fmt.Errorf("management: %w", err)
+		}
+	}
 	return validateLogging(s.Logging)
+}
+
+func (m Management) Validate(serverPrefix netip.Prefix) error {
+	host, _, err := net.SplitHostPort(m.Listen)
+	if err != nil {
+		return fmt.Errorf("listen: %w", err)
+	}
+	if host != "localhost" {
+		ip := net.ParseIP(host)
+		if ip == nil || !ip.IsLoopback() {
+			return errors.New("listen must use a loopback address; terminate HTTPS at a reverse proxy")
+		}
+	}
+	if strings.TrimSpace(m.DatabasePath) == "" {
+		return errors.New("database_path is required")
+	}
+	if strings.TrimSpace(m.PublicRelay) == "" {
+		return errors.New("public_relay is required")
+	}
+	if _, err := net.ResolveUDPAddr("udp", m.PublicRelay); err != nil {
+		return fmt.Errorf("public_relay: %w", err)
+	}
+	pool, err := netip.ParsePrefix(m.TunnelPool)
+	if err != nil || !pool.Addr().Is4() {
+		return errors.New("tunnel_pool must be an IPv4 prefix")
+	}
+	if pool.Masked() != serverPrefix.Masked() {
+		return fmt.Errorf("tunnel_pool %s must match server tunnel subnet %s", pool.Masked(), serverPrefix.Masked())
+	}
+	if pool.Bits() > 30 || pool.Bits() < 16 {
+		return errors.New("tunnel_pool prefix length must be between /16 and /30")
+	}
+	if strings.TrimSpace(m.AdminTokenEnv) == "" || strings.TrimSpace(m.MasterKeyEnv) == "" {
+		return errors.New("admin_token_env and master_key_env are required")
+	}
+	return validateDuration("activation_ttl", m.ActivationTTL, time.Minute, 24*time.Hour)
+}
+
+func (m Management) Secrets() (string, []byte, error) {
+	adminToken := os.Getenv(m.AdminTokenEnv)
+	if len(adminToken) < 32 {
+		return "", nil, fmt.Errorf("environment variable %s must contain at least 32 characters", m.AdminTokenEnv)
+	}
+	masterValue := os.Getenv(m.MasterKeyEnv)
+	if masterValue == "" {
+		return "", nil, fmt.Errorf("environment variable %s is empty", m.MasterKeyEnv)
+	}
+	masterKey, err := protocol.ParseKey(masterValue)
+	if err != nil {
+		return "", nil, fmt.Errorf("%s: %w", m.MasterKeyEnv, err)
+	}
+	return adminToken, masterKey, nil
 }
 
 func validateTunnel(address string, mtu int) error {

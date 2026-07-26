@@ -1,18 +1,32 @@
 #Requires -RunAsAdministrator
 param(
     [Parameter(Mandatory = $true)][string]$SourceBinary,
-    [Parameter(Mandatory = $true)][string]$SourceProfile,
     [Parameter(Mandatory = $true)][string]$WintunDll,
+    [string]$SourceProfile,
+    [string]$EnrollmentUrl,
+    [string]$ActivationCode,
     [string]$InstallDirectory = "$env:ProgramFiles\LinkForge",
     [string]$DataDirectory = "$env:ProgramData\LinkForge",
     [string]$Listen = "127.0.0.1:9090"
 )
 
 $ErrorActionPreference = "Stop"
-foreach ($Path in @($SourceBinary, $SourceProfile, $WintunDll)) {
+foreach ($Path in @($SourceBinary, $WintunDll)) {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         throw "Required file not found: $Path"
     }
+}
+if ($SourceProfile -and $EnrollmentUrl) {
+    throw "Set either SourceProfile or EnrollmentUrl, not both."
+}
+if (-not $SourceProfile -and -not $EnrollmentUrl) {
+    throw "SourceProfile or EnrollmentUrl is required."
+}
+if ($SourceProfile -and -not (Test-Path -LiteralPath $SourceProfile -PathType Leaf)) {
+    throw "Required file not found: $SourceProfile"
+}
+if ($EnrollmentUrl -and -not $ActivationCode) {
+    throw "ActivationCode is required with EnrollmentUrl."
 }
 
 $Signature = Get-AuthenticodeSignature -FilePath $WintunDll
@@ -26,7 +40,23 @@ $InstalledWintun = Join-Path $InstallDirectory "wintun.dll"
 $Profile = Join-Path $DataDirectory "profile.json"
 Copy-Item -LiteralPath $SourceBinary -Destination $Binary -Force
 Copy-Item -LiteralPath $WintunDll -Destination $InstalledWintun -Force
-Copy-Item -LiteralPath $SourceProfile -Destination $Profile -Force
+if ($SourceProfile) {
+    Copy-Item -LiteralPath $SourceProfile -Destination $Profile -Force
+}
+else {
+    $PreviousCode = [Environment]::GetEnvironmentVariable("LINKFORGE_ACTIVATION_CODE", "Process")
+    try {
+        [Environment]::SetEnvironmentVariable("LINKFORGE_ACTIVATION_CODE", $ActivationCode, "Process")
+        & $Binary enroll -url $EnrollmentUrl -code-env LINKFORGE_ACTIVATION_CODE -device-name $env:COMPUTERNAME -output $Profile
+        if ($LASTEXITCODE -ne 0) {
+            throw "LinkForge enrollment failed with exit code $LASTEXITCODE."
+        }
+    }
+    finally {
+        [Environment]::SetEnvironmentVariable("LINKFORGE_ACTIVATION_CODE", $PreviousCode, "Process")
+        $ActivationCode = $null
+    }
+}
 
 & icacls.exe $Profile /inheritance:r /grant:r "*S-1-5-18:(F)" "*S-1-5-32-544:(F)" | Out-Null
 

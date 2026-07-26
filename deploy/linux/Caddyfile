@@ -1,0 +1,12 @@
+ENROLLMENT_HOST {
+	encode zstd gzip
+
+	@enrollment path /v1/enroll /v1/healthz
+	handle @enrollment {
+		reverse_proxy 127.0.0.1:8443
+	}
+
+	handle {
+		respond 404
+	}
+}

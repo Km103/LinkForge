@@ -36,21 +36,23 @@ one connection arriving from multiple public source addresses.
 The primary user experience uses a LinkForge-operated relay. Each device gets:
 
 - one platform binary;
-- one unique `profile.json` containing its relay assignment and credential;
+- one short-lived, one-use activation code;
 - the official `wintun.dll` on Windows.
 
-The profile contains no Wi-Fi, Ethernet, USB, gateway, or route values.
-LinkForge discovers current physical default-route interfaces, performs a
-short encrypted capacity calibration, protects the relay path on each
-interface, and installs the tunnel routes when the user clicks
-**Aggregate traffic**.
+The installer exchanges the activation code over HTTPS and creates a unique
+mode-0600 `profile.json` locally. The profile contains no Wi-Fi, Ethernet, USB,
+gateway, or route values. LinkForge discovers current physical default-route
+interfaces, performs a short encrypted capacity calibration, protects the
+relay path on each interface, and installs the tunnel routes when the user
+clicks **Aggregate traffic**.
 
 Linux installation:
 
 ```bash
-sudo ./deploy/linux/install-client-app.sh \
+sudo LINKFORGE_ACTIVATION_CODE=lf_... \
+  ./deploy/linux/install-client-app.sh \
   --binary ./linkforge-linux-amd64 \
-  --profile ./profile.json
+  --enrollment-url https://ENROLLMENT_HOST
 ```
 
 Open **LinkForge** from the application menu (or browse to
@@ -61,7 +63,8 @@ Windows installation from an Administrator PowerShell:
 ```powershell
 .\deploy\windows\install-client-app.ps1 `
   -SourceBinary .\linkforge-windows-amd64.exe `
-  -SourceProfile .\profile.json `
+  -EnrollmentUrl https://ENROLLMENT_HOST `
+  -ActivationCode lf_... `
   -WintunDll .\wintun.dll
 ```
 
@@ -69,7 +72,7 @@ Double-click the installed LinkForge desktop shortcut and click
 **Aggregate traffic**. See [Managed service and enrollment](docs/managed-service.md)
 and [Windows client](docs/windows.md).
 
-Treat `profile.json` like a password. A managed profile is unique per device
+Treat the generated `profile.json` like a password. It is unique per device
 and must never be committed to source control.
 
 ## Self-hosted relay
@@ -102,7 +105,7 @@ compiled into the product.
 
 ## Operator quick start
 
-Prerequisites are Go 1.23.1+, root/CAP_NET_ADMIN on Linux, or Administrator on
+Prerequisites are Go 1.25+, root/CAP_NET_ADMIN on Linux, or Administrator on
 Windows. `doctor` does not create a TUN and normally needs no elevation.
 
 ```bash
@@ -127,6 +130,7 @@ split-route configurations.
 ## Documentation
 
 - [Managed service and enrollment](docs/managed-service.md)
+- [Managed enrollment API](docs/enrollment-api.md)
 - [How it works](docs/how-it-works.md)
 - [Configuration reference](docs/configuration.md)
 - [Linux relay deployment](docs/deploy-linux.md)
@@ -138,8 +142,8 @@ split-route configurations.
 ## Current limitations
 
 - Tunneled traffic is IPv4. Physical UDP support is currently IPv4-oriented.
-- The open-source repository supplies a relay and per-device profiles, not a
-  multi-tenant billing/account control plane or relay HA.
+- The open-source repository supplies enrollment, per-device records, and
+  live revocation for one relay, not billing, account login, or relay HA.
 - Forward-error correction, redundant-packet mode, kill-switch policy, and
   automatic relay-region selection are not implemented.
 - Capacity calibration is intentionally short; unusual links may benefit from

@@ -1,9 +1,10 @@
-module github.com/linkforge/linkforge
+module github.com/Km103/LinkForge
 
-go 1.23.1
+go 1.25.0
 
 require (
-	golang.org/x/sys v0.32.0
+	go.etcd.io/bbolt v1.5.0
+	golang.org/x/sys v0.45.0
 	golang.zx2c4.com/wireguard v0.0.0-20260522210424-ecfc5a8d5446
 )
 

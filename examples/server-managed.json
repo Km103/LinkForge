@@ -1,0 +1,28 @@
+{
+  "listen": ":4430",
+  "tunnel_name": "linkforge0",
+  "tunnel_address": "10.77.0.1/24",
+  "mtu": 1280,
+  "clients": [],
+  "configure_interface": true,
+  "session_timeout": "2m",
+  "stats_interval": "15s",
+  "reorder_delay": "80ms",
+  "reorder_window": 512,
+  "logging": {
+    "level": "info",
+    "format": "json"
+  },
+  "metrics": {
+    "listen": "127.0.0.1:9091"
+  },
+  "management": {
+    "listen": "127.0.0.1:8443",
+    "database_path": "/var/lib/linkforge/control.db",
+    "public_relay": "RELAY_HOST:4430",
+    "tunnel_pool": "10.77.0.0/24",
+    "admin_token_env": "LINKFORGE_ADMIN_TOKEN",
+    "master_key_env": "LINKFORGE_CONTROL_MASTER_KEY",
+    "activation_ttl": "15m"
+  }
+}

@@ -10,10 +10,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/linkforge/linkforge/internal/config"
-	"github.com/linkforge/linkforge/internal/metrics"
-	"github.com/linkforge/linkforge/internal/protocol"
-	"github.com/linkforge/linkforge/internal/tun"
+	"github.com/Km103/LinkForge/internal/config"
+	"github.com/Km103/LinkForge/internal/metrics"
+	"github.com/Km103/LinkForge/internal/protocol"
+	"github.com/Km103/LinkForge/internal/tun"
 )
 
 const (
@@ -175,6 +175,73 @@ func TestDiagnosticUsesEveryPath(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatal("diagnostic paths were not retired after close")
+}
+
+func TestManagedCredentialAuthorizationRotationAndRevocation(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server, err := NewServer(config.Server{
+		TunnelAddress: "10.77.0.1/24",
+		ReorderWindow: 512,
+	}, tun.NewMemory("managed-server", 4), logger, metrics.New("server"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstKey, err := protocol.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential := config.ClientCredential{
+		Name:          "managed-laptop",
+		ClientID:      testClientID,
+		PSK:           firstKey,
+		TunnelAddress: "10.77.0.3/24",
+	}
+	if err := server.AuthorizeClient(credential); err != nil {
+		t.Fatal(err)
+	}
+	if server.credentialCount() != 1 {
+		t.Fatalf("credential count=%d", server.credentialCount())
+	}
+	current, ok := server.credential(testClientID)
+	if !ok {
+		t.Fatal("managed credential was not installed")
+	}
+	if _, err := server.getOrCreateSession(current); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := server.sessionByClient[testClientID]; !ok {
+		t.Fatal("managed session was not created")
+	}
+
+	duplicateID, err := protocol.GenerateClientID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := server.AuthorizeClient(config.ClientCredential{
+		Name:          "duplicate-ip",
+		ClientID:      duplicateID,
+		PSK:           firstKey,
+		TunnelAddress: "10.77.0.3/24",
+	}); err == nil {
+		t.Fatal("duplicate managed IP/key was accepted")
+	}
+
+	secondKey, err := protocol.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential.PSK = secondKey
+	if err := server.AuthorizeClient(credential); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := server.sessionByClient[testClientID]; ok {
+		t.Fatal("key rotation did not terminate the old session")
+	}
+
+	server.RevokeClient(testClientID)
+	if server.credentialCount() != 0 {
+		t.Fatal("revoked managed credential remains authorized")
+	}
 }
 
 func availableUDPAddress(t *testing.T) string {

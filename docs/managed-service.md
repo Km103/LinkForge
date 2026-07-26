@@ -4,22 +4,27 @@ LinkForge is managed-first and self-hostable:
 
 1. The normal user receives a device bundle for a LinkForge-operated relay.
 2. The advanced user may deploy the same relay code on their own Linux VM and
-   issue a profile that points to it.
+   issue an activation code that points to it.
 
 There is no behavioral switch in the client. The packaged binary is the same;
-`profile.json` selects the relay and authenticates one device.
+enrollment creates a local `profile.json` that selects the relay and
+authenticates exactly one device.
 
 ## What a client needs
 
 | Platform | Required files | One-time action |
 |---|---|---|
-| Linux amd64 | `linkforge-linux-amd64`, `profile.json`, Linux installer assets | Run the installer as root. |
-| Windows amd64 | `linkforge-windows-amd64.exe`, `profile.json`, official signed `wintun.dll`, PowerShell installer | Run the installer as Administrator. |
+| Linux amd64 | `linkforge-linux-amd64`, activation code, enrollment URL, Linux installer assets | Run the installer as root. |
+| Windows amd64 | `linkforge-windows-amd64.exe`, activation code, enrollment URL, official signed `wintun.dll`, PowerShell installer | Run the installer as Administrator. |
 
 After installation, the privileged background process owns TUN and route
 changes. The user opens the local dashboard and clicks **Aggregate traffic**.
 They do not enter interface names, source IPs, gateways, weights, routes, or a
 relay address.
+
+The installer sends the one-time activation code over HTTPS, receives a
+unique device identity/key/address, and writes the profile with restricted
+permissions. Users never import or hand-edit a profile.
 
 The dashboard is bound to loopback. Its start/stop POST requests require a
 random in-memory capability token embedded in the same-origin page. Prometheus
@@ -80,12 +85,14 @@ client Ethernet/Wi-Fi/USB addresses.
 
 ## Managed relay operator boundary
 
-The currently deployed relay is a pilot single-region service. A public
-multi-user offering still needs a separate authenticated enrollment/control
-plane for accounts, profile issuance/revocation, usage policy, relay selection,
-capacity admission, upgrades, abuse response, and HA. Those concerns are
-deliberately outside the packet-forwarding daemon; they should generate the
-same per-device server credential and profile format.
+The included single-relay control plane issues expiring one-use activation
+codes, creates unique encrypted per-device credentials, persists non-secret
+device records, and applies rotation/revocation live. Its admin API is
+loopback-only; TLS exposes only health and enrollment.
+
+A public multi-region offering still needs account login, billing, usage
+policy, relay selection, capacity admission, upgrades, abuse response, a
+replicated database, and HA. See [enrollment-api.md](enrollment-api.md).
 
 ## Self-hosting
 

@@ -23,14 +23,16 @@ go build -o linkforge.exe .\cmd\linkforge
 
 ## One-click installation
 
-The managed bundle contains the Windows executable, per-device profile,
-installer, and official Wintun DLL. From an Administrator PowerShell:
+The managed bundle contains the Windows executable, a short-lived activation
+code, the enrollment URL, installer, and official Wintun DLL. From an
+Administrator PowerShell:
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass
 .\deploy\windows\install-client-app.ps1 `
   -SourceBinary .\linkforge-windows-amd64.exe `
-  -SourceProfile .\profile.json `
+  -EnrollmentUrl https://ENROLLMENT_HOST `
+  -ActivationCode lf_... `
   -WintunDll .\wintun.dll
 ```
 
@@ -38,7 +40,8 @@ The installer:
 
 - verifies that the Wintun DLL has a valid Authenticode signature;
 - copies the binary/DLL under Program Files;
-- copies the secret profile under ProgramData with a restricted ACL;
+- exchanges the one-use activation code over HTTPS;
+- creates the unique secret profile under ProgramData with a restricted ACL;
 - registers a highest-privilege SYSTEM startup task for the local app;
 - creates a LinkForge desktop URL shortcut.
 

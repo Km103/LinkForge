@@ -5,7 +5,7 @@ import (
 	"log/slog"
 	"strings"
 
-	"github.com/linkforge/linkforge/internal/config"
+	"github.com/Km103/LinkForge/internal/config"
 )
 
 func New(c config.Logging, output io.Writer) *slog.Logger {

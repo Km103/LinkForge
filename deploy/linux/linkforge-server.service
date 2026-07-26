@@ -1,6 +1,6 @@
 [Unit]
 Description=LinkForge multipath relay
-Documentation=https://github.com/linkforge/linkforge
+Documentation=https://github.com/Km103/LinkForge
 After=network-online.target linkforge-firewall.service
 Wants=network-online.target linkforge-firewall.service
 
@@ -18,6 +18,9 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
+StateDirectory=linkforge
+StateDirectoryMode=0700
+ReadWritePaths=/var/lib/linkforge
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true

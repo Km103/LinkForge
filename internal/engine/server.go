@@ -16,21 +16,24 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/linkforge/linkforge/internal/config"
-	"github.com/linkforge/linkforge/internal/metrics"
-	"github.com/linkforge/linkforge/internal/protocol"
-	"github.com/linkforge/linkforge/internal/reorder"
-	"github.com/linkforge/linkforge/internal/scheduler"
-	"github.com/linkforge/linkforge/internal/tun"
+	"github.com/Km103/LinkForge/internal/config"
+	"github.com/Km103/LinkForge/internal/metrics"
+	"github.com/Km103/LinkForge/internal/protocol"
+	"github.com/Km103/LinkForge/internal/reorder"
+	"github.com/Km103/LinkForge/internal/scheduler"
+	"github.com/Km103/LinkForge/internal/tun"
 )
 
 type Server struct {
-	config      config.Server
-	logger      *slog.Logger
-	metrics     *metrics.Registry
-	tun         tun.Device
-	conn        *net.UDPConn
-	credentials map[string]serverCredential
+	config       config.Server
+	logger       *slog.Logger
+	metrics      *metrics.Registry
+	tun          tun.Device
+	conn         *net.UDPConn
+	credentialMu sync.RWMutex
+	credentials  map[string]serverCredential
+	hookMu       sync.RWMutex
+	clientSeen   func(string)
 
 	mu              sync.RWMutex
 	sessions        map[uint64]*serverSession
@@ -90,37 +93,100 @@ func NewServer(c config.Server, device tun.Device, logger *slog.Logger, registry
 	if registry == nil {
 		registry = metrics.New("server")
 	}
-	credentials := make(map[string]serverCredential, len(c.Clients))
-	for _, configured := range c.Clients {
-		id, err := protocol.ParseClientID(configured.ClientID)
-		if err != nil {
-			return nil, err
-		}
-		key, err := configured.Key()
-		if err != nil {
-			return nil, err
-		}
-		prefix, err := netip.ParsePrefix(configured.TunnelAddress)
-		if err != nil {
-			return nil, err
-		}
-		credentials[protocol.ClientIDString(id)] = serverCredential{
-			name:     configured.Name,
-			clientID: id,
-			key:      key,
-			tunnelIP: prefix.Addr(),
-		}
-	}
-	return &Server{
+	server := &Server{
 		config:          c,
 		logger:          logger,
 		metrics:         registry,
 		tun:             device,
-		credentials:     credentials,
+		credentials:     make(map[string]serverCredential, len(c.Clients)),
 		sessions:        make(map[uint64]*serverSession),
 		sessionByClient: make(map[string]*serverSession),
 		sessionByIP:     make(map[netip.Addr]*serverSession),
-	}, nil
+	}
+	for _, configured := range c.Clients {
+		if err := server.AuthorizeClient(configured); err != nil {
+			return nil, err
+		}
+	}
+	return server, nil
+}
+
+func (s *Server) AuthorizeClient(configured config.ClientCredential) error {
+	id, err := protocol.ParseClientID(configured.ClientID)
+	if err != nil {
+		return err
+	}
+	key, err := configured.Key()
+	if err != nil {
+		return err
+	}
+	prefix, err := netip.ParsePrefix(configured.TunnelAddress)
+	if err != nil || !prefix.Addr().Is4() {
+		return errors.New("managed client tunnel address must be IPv4")
+	}
+	serverPrefix, err := netip.ParsePrefix(s.config.TunnelAddress)
+	if err != nil {
+		return err
+	}
+	if !serverPrefix.Contains(prefix.Addr()) || prefix.Addr() == serverPrefix.Addr() {
+		return fmt.Errorf("managed client tunnel IP %s is outside %s", prefix.Addr(), serverPrefix)
+	}
+	idText := protocol.ClientIDString(id)
+	credential := serverCredential{
+		name:     configured.Name,
+		clientID: id,
+		key:      append([]byte(nil), key...),
+		tunnelIP: prefix.Addr(),
+	}
+	s.credentialMu.Lock()
+	for otherID, existing := range s.credentials {
+		if otherID != idText && existing.tunnelIP == credential.tunnelIP {
+			s.credentialMu.Unlock()
+			return fmt.Errorf("managed client tunnel IP %s is already assigned", credential.tunnelIP)
+		}
+		if otherID != idText && bytes.Equal(existing.key, credential.key) {
+			s.credentialMu.Unlock()
+			return errors.New("managed client key is already assigned")
+		}
+	}
+	previous, replacing := s.credentials[idText]
+	s.credentials[idText] = credential
+	s.credentialMu.Unlock()
+	if replacing && (!bytes.Equal(previous.key, credential.key) || previous.tunnelIP != credential.tunnelIP) {
+		s.terminateClientSession(idText, "credential replaced")
+	}
+	return nil
+}
+
+func (s *Server) RevokeClient(clientID string) {
+	id, err := protocol.ParseClientID(clientID)
+	if err != nil {
+		return
+	}
+	idText := protocol.ClientIDString(id)
+	s.credentialMu.Lock()
+	delete(s.credentials, idText)
+	s.credentialMu.Unlock()
+	s.terminateClientSession(idText, "credential revoked")
+}
+
+func (s *Server) SetClientSeenHook(hook func(string)) {
+	s.hookMu.Lock()
+	s.clientSeen = hook
+	s.hookMu.Unlock()
+}
+
+func (s *Server) credential(clientID string) (serverCredential, bool) {
+	s.credentialMu.RLock()
+	defer s.credentialMu.RUnlock()
+	credential, ok := s.credentials[clientID]
+	return credential, ok
+}
+
+func (s *Server) credentialCount() int {
+	s.credentialMu.RLock()
+	defer s.credentialMu.RUnlock()
+	return len(s.credentials)
 }
 
 func (s *Server) Run(ctx context.Context) error {
@@ -141,7 +207,7 @@ func (s *Server) Run(ctx context.Context) error {
 	s.logger.Info("relay listening",
 		"address", conn.LocalAddr(),
 		"tunnel", s.tun.Name(),
-		"authorized_clients", len(s.credentials),
+		"authorized_clients", s.credentialCount(),
 	)
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -196,7 +262,7 @@ func (s *Server) handleHello(remote *net.UDPAddr, header protocol.Header, packet
 	var clientID [16]byte
 	copy(clientID[:], payload[:16])
 	idText := protocol.ClientIDString(clientID)
-	credential, ok := s.credentials[idText]
+	credential, ok := s.credential(idText)
 	if !ok {
 		s.metrics.AuthFailures.Add(1)
 		s.logger.Warn("hello from unknown client", "remote", remote, "client_id", idText)
@@ -280,6 +346,13 @@ func (s *Server) handleHello(remote *net.UDPAddr, header protocol.Header, packet
 
 func (s *Server) getOrCreateSession(credential serverCredential) (*serverSession, error) {
 	idText := protocol.ClientIDString(credential.clientID)
+	s.credentialMu.RLock()
+	current, authorized := s.credentials[idText]
+	if !authorized || !bytes.Equal(current.key, credential.key) || current.tunnelIP != credential.tunnelIP {
+		s.credentialMu.RUnlock()
+		return nil, errors.New("client credential changed during handshake")
+	}
+	defer s.credentialMu.RUnlock()
 	s.mu.RLock()
 	existing := s.sessionByClient[idText]
 	s.mu.RUnlock()
@@ -323,7 +396,33 @@ func (s *Server) getOrCreateSession(credential serverCredential) (*serverSession
 	s.sessionByIP[credential.tunnelIP] = session
 	s.metrics.ActiveSessions.Add(1)
 	session.logger.Info("client session created")
+	s.hookMu.RLock()
+	hook := s.clientSeen
+	s.hookMu.RUnlock()
+	if hook != nil {
+		go hook(idText)
+	}
 	return session, nil
+}
+
+func (s *Server) terminateClientSession(clientID, reason string) {
+	s.mu.Lock()
+	session := s.sessionByClient[clientID]
+	if session != nil {
+		delete(s.sessions, session.id)
+		delete(s.sessionByClient, clientID)
+		delete(s.sessionByIP, session.credential.tunnelIP)
+		s.metrics.ActiveSessions.Add(-1)
+	}
+	s.mu.Unlock()
+	if session == nil {
+		return
+	}
+	for _, path := range session.snapshotPaths() {
+		path.healthy.Store(false)
+		path.metric.Healthy.Store(false)
+	}
+	session.logger.Info("client session terminated", "reason", reason)
 }
 
 func (s *Server) handleEncrypted(remote *net.UDPAddr, header protocol.Header, packet []byte) {

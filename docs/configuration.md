@@ -58,6 +58,22 @@ The server tunnel CIDR must contain every client tunnel IP. Client IDs and IPs
 must be unique. Rotate a client without affecting others by replacing only its
 key and restarting the relay.
 
+The optional `management` object enables managed enrollment:
+
+| Field | Meaning |
+|---|---|
+| `listen` | Loopback-only control API address; default `127.0.0.1:8443`. |
+| `database_path` | Persistent bbolt device database, normally under `/var/lib/linkforge`. |
+| `public_relay` | Public relay DNS name and UDP port written into enrolled profiles. |
+| `tunnel_pool` | IPv4 prefix used for managed device address allocation; must match the relay subnet. |
+| `admin_token_env` | Environment variable holding the admin bearer token. |
+| `master_key_env` | Environment variable holding the base64/hex 32-byte database encryption key. |
+| `activation_ttl` | Default one-time activation lifetime; default `15m`. |
+
+When management is enabled, `clients` may be empty. Static clients and the
+relay address are reserved from the managed address pool, so both modes can
+coexist during migration.
+
 ## Route modes
 
 The low-level examples ship with `routes: []`, which establishes the tunnel
