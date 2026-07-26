@@ -1,0 +1,52 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: gofmt -w cmd internal
+      - run: git diff --exit-code
+      - run: go vet ./...
+      - run: go test -race ./... -count=1
+
+  cross-build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            output: linkforge-linux-amd64
+          - goos: linux
+            goarch: arm64
+            output: linkforge-linux-arm64
+          - goos: windows
+            goarch: amd64
+            output: linkforge-windows-amd64.exe
+          - goos: windows
+            goarch: arm64
+            output: linkforge-windows-arm64.exe
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go build -trimpath -o "${{ matrix.output }}" ./cmd/linkforge
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}

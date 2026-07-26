@@ -1,0 +1,33 @@
+[Unit]
+Description=LinkForge multipath relay
+Documentation=https://github.com/linkforge/linkforge
+After=network-online.target linkforge-firewall.service
+Wants=network-online.target linkforge-firewall.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+EnvironmentFile=/etc/linkforge/linkforge.env
+ExecStart=/usr/local/bin/linkforge server -config /etc/linkforge/server.json
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=15s
+LimitNOFILE=1048576
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+DevicePolicy=closed
+DeviceAllow=/dev/net/tun rw
+
+[Install]
+WantedBy=multi-user.target

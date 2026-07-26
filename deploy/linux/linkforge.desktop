@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=LinkForge
+Comment=Aggregate Ethernet, Wi-Fi, and tethering traffic
+Exec=xdg-open http://127.0.0.1:9090/
+Icon=network-vpn
+Terminal=false
+Categories=Network;Utility;

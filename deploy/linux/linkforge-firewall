@@ -1,0 +1,58 @@
+#!/bin/sh
+set -eu
+
+action="${1:-apply}"
+tunnel_interface="${LINKFORGE_TUN_INTERFACE:-linkforge0}"
+tunnel_cidr="${LINKFORGE_TUNNEL_CIDR:-10.77.0.0/24}"
+public_interface="${LINKFORGE_PUBLIC_INTERFACE:-}"
+iptables_bin="${IPTABLES:-iptables}"
+
+if [ -z "$public_interface" ]; then
+    public_interface="$(ip -4 route show default | awk 'NR == 1 { print $5 }')"
+fi
+if [ -z "$public_interface" ]; then
+    echo "LinkForge firewall: no IPv4 default-route interface found" >&2
+    exit 1
+fi
+
+forward_chain="FORWARD"
+if "$iptables_bin" -w -nL DOCKER-USER >/dev/null 2>&1; then
+    forward_chain="DOCKER-USER"
+fi
+
+add_rule() {
+    table="$1"
+    chain="$2"
+    shift 2
+    if ! "$iptables_bin" -w $table -C "$chain" "$@" >/dev/null 2>&1; then
+        "$iptables_bin" -w $table -I "$chain" 1 "$@"
+    fi
+}
+
+delete_rule() {
+    table="$1"
+    chain="$2"
+    shift 2
+    while "$iptables_bin" -w $table -C "$chain" "$@" >/dev/null 2>&1; do
+        "$iptables_bin" -w $table -D "$chain" "$@"
+    done
+}
+
+case "$action" in
+    apply)
+        add_rule "" "$forward_chain" -i "$tunnel_interface" -o "$public_interface" -j ACCEPT
+        add_rule "" "$forward_chain" -i "$public_interface" -o "$tunnel_interface" \
+            -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+        add_rule "-t nat" POSTROUTING -s "$tunnel_cidr" -o "$public_interface" -j MASQUERADE
+        ;;
+    remove)
+        delete_rule "-t nat" POSTROUTING -s "$tunnel_cidr" -o "$public_interface" -j MASQUERADE
+        delete_rule "" "$forward_chain" -i "$public_interface" -o "$tunnel_interface" \
+            -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+        delete_rule "" "$forward_chain" -i "$tunnel_interface" -o "$public_interface" -j ACCEPT
+        ;;
+    *)
+        echo "usage: $0 [apply|remove]" >&2
+        exit 2
+        ;;
+esac

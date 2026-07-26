@@ -1,0 +1,10 @@
+/bin/
+/dist/
+*.log
+*.out
+*.exe
+/client.json
+/server.json
+.env
+.idea/
+.vscode/

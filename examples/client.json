@@ -1,0 +1,38 @@
+{
+  "server": "RELAY_PUBLIC_IP:4430",
+  "client_id": "67c42c03753048d285b2e7437299235d",
+  "psk_env": "LINKFORGE_CLIENT_KEY",
+  "tunnel_name": "linkforge0",
+  "tunnel_address": "10.77.0.2/24",
+  "mtu": 1280,
+  "paths": [
+    {
+      "name": "wifi",
+      "local_address": "192.168.1.20",
+      "interface": "wlan0",
+      "weight": 3
+    },
+    {
+      "name": "usb-tether",
+      "local_address": "192.168.42.10",
+      "interface": "usb0",
+      "weight": 1
+    }
+  ],
+  "auto_discover_paths": false,
+  "routes": [],
+  "traffic_mode": "manual",
+  "configure_interface": true,
+  "health_interval": "2s",
+  "stats_interval": "15s",
+  "handshake_timeout": "8s",
+  "reorder_delay": "80ms",
+  "reorder_window": 512,
+  "logging": {
+    "level": "info",
+    "format": "json"
+  },
+  "metrics": {
+    "listen": "127.0.0.1:9090"
+  }
+}
