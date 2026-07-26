@@ -83,6 +83,7 @@ profile.
 
 | Method | Path | Access | Purpose |
 |---|---|---|---|
+| `GET` | `/` | Public | Service status and client-dashboard location. |
 | `GET` | `/v1/healthz` | Public | Enrollment service liveness. |
 | `POST` | `/v1/enroll` | Activation code | Register one device and return its profile. |
 | `POST` | `/v1/admin/activations` | Admin bearer token | Issue a one-time activation code. |

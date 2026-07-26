@@ -6,6 +6,12 @@ ENROLLMENT_HOST {
 		reverse_proxy 127.0.0.1:8443
 	}
 
+	@root path /
+	handle @root {
+		header Content-Type application/json
+		respond `{"status":"ok","service":"LinkForge enrollment","dashboard":"http://127.0.0.1:9090/"}`
+	}
+
 	handle {
 		respond 404
 	}
