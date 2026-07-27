@@ -49,18 +49,21 @@ type serverCredential struct {
 }
 
 type serverSession struct {
-	id         uint64
-	credential serverCredential
-	logger     *slog.Logger
-	scheduler  *scheduler.Scheduler
-	createdAt  time.Time
-	lastSeen   atomic.Int64
-	nextPathID atomic.Uint32
-	dataSeq    atomic.Uint64
-	reorder    *reorder.Buffer
-	deliverMu  sync.Mutex
-	mu         sync.RWMutex
-	paths      map[uint32]*serverPath
+	id            uint64
+	credential    serverCredential
+	instanceNonce [16]byte
+	legacy        bool
+	logger        *slog.Logger
+	scheduler     *scheduler.Scheduler
+	createdAt     time.Time
+	lastSeen      atomic.Int64
+	nextPathID    atomic.Uint32
+	dataSeq       atomic.Uint64
+	reorder       *reorder.Buffer
+	deliverMu     sync.Mutex
+	mu            sync.RWMutex
+	closing       bool
+	paths         map[uint32]*serverPath
 }
 
 type serverPath struct {
@@ -198,6 +201,7 @@ func (s *Server) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", listen, err)
 	}
+	tuneUDPSocket(conn, s.logger)
 	s.conn = conn
 	s.metrics.SetReady(true)
 	defer s.metrics.SetReady(false)
@@ -274,7 +278,7 @@ func (s *Server) handleHello(remote *net.UDPAddr, header protocol.Header, packet
 		s.logger.Warn("client hello rejected", "remote", remote, "client", credential.name, "error", err)
 		return
 	}
-	session, err := s.getOrCreateSession(credential)
+	session, err := s.getOrCreateSession(credential, hello)
 	if err != nil {
 		s.logger.Error("could not create client session", "client", credential.name, "error", err)
 		return
@@ -333,18 +337,23 @@ func (s *Server) handleHello(remote *net.UDPAddr, header protocol.Header, packet
 	path.healthy.Store(true)
 	path.metric.Healthy.Store(true)
 	path.lastSeenNanos.Store(time.Now().UnixNano())
-	session.mu.Lock()
-	session.paths[pathID] = path
-	session.mu.Unlock()
+	if !session.addPath(path) {
+		path.healthy.Store(false)
+		path.metric.Healthy.Store(false)
+		return
+	}
 	session.touch()
 	if _, err := s.conn.WriteToUDP(welcomePacket, remote); err != nil {
 		path.recordWriteError(err)
+		if session.removePath(path) {
+			s.terminateSessionIfCurrent(session, "initial welcome failed")
+		}
 		return
 	}
 	path.logger.Info("path registered", "remote", remote)
 }
 
-func (s *Server) getOrCreateSession(credential serverCredential) (*serverSession, error) {
+func (s *Server) getOrCreateSession(credential serverCredential, hello protocol.Hello) (*serverSession, error) {
 	idText := protocol.ClientIDString(credential.clientID)
 	s.credentialMu.RLock()
 	current, authorized := s.credentials[idText]
@@ -353,32 +362,36 @@ func (s *Server) getOrCreateSession(credential serverCredential) (*serverSession
 		return nil, errors.New("client credential changed during handshake")
 	}
 	defer s.credentialMu.RUnlock()
-	s.mu.RLock()
-	existing := s.sessionByClient[idText]
-	s.mu.RUnlock()
-	if existing != nil {
-		return existing, nil
-	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if existing = s.sessionByClient[idText]; existing != nil {
+	existing := s.sessionByClient[idText]
+	if existing != nil && existing.accepts(hello) {
+		s.mu.Unlock()
 		return existing, nil
 	}
 	sessionID, err := randomUint64()
 	if err != nil {
+		s.mu.Unlock()
 		return nil, err
 	}
 	for sessionID == 0 || s.sessions[sessionID] != nil {
 		sessionID, err = randomUint64()
 		if err != nil {
+			s.mu.Unlock()
 			return nil, err
 		}
 	}
+	var replacedPaths []*serverPath
+	if existing != nil {
+		replacedPaths = existing.markClosing()
+		s.detachSessionLocked(existing)
+	}
 	now := time.Now()
 	session := &serverSession{
-		id:         sessionID,
-		credential: credential,
+		id:            sessionID,
+		credential:    credential,
+		instanceNonce: hello.InstanceNonce,
+		legacy:        hello.WireVersion < 2,
 		logger: s.logger.With(
 			"session_id", sessionID,
 			"client", credential.name,
@@ -395,6 +408,14 @@ func (s *Server) getOrCreateSession(credential serverCredential) (*serverSession
 	s.sessionByClient[idText] = session
 	s.sessionByIP[credential.tunnelIP] = session
 	s.metrics.ActiveSessions.Add(1)
+	s.mu.Unlock()
+	if existing != nil {
+		for _, path := range replacedPaths {
+			path.healthy.Store(false)
+			path.metric.Healthy.Store(false)
+		}
+		existing.logger.Info("client session terminated", "reason", "new client process connected")
+	}
 	session.logger.Info("client session created")
 	s.hookMu.RLock()
 	hook := s.clientSeen
@@ -408,21 +429,52 @@ func (s *Server) getOrCreateSession(credential serverCredential) (*serverSession
 func (s *Server) terminateClientSession(clientID, reason string) {
 	s.mu.Lock()
 	session := s.sessionByClient[clientID]
+	var paths []*serverPath
 	if session != nil {
-		delete(s.sessions, session.id)
-		delete(s.sessionByClient, clientID)
-		delete(s.sessionByIP, session.credential.tunnelIP)
-		s.metrics.ActiveSessions.Add(-1)
+		paths = session.markClosing()
+		s.detachSessionLocked(session)
 	}
 	s.mu.Unlock()
 	if session == nil {
 		return
 	}
-	for _, path := range session.snapshotPaths() {
+	for _, path := range paths {
 		path.healthy.Store(false)
 		path.metric.Healthy.Store(false)
 	}
 	session.logger.Info("client session terminated", "reason", reason)
+}
+
+func (s *Server) terminateSessionIfCurrent(session *serverSession, reason string) {
+	s.mu.Lock()
+	if s.sessions[session.id] != session {
+		s.mu.Unlock()
+		return
+	}
+	paths := session.markClosing()
+	s.detachSessionLocked(session)
+	s.mu.Unlock()
+	for _, path := range paths {
+		path.healthy.Store(false)
+		path.metric.Healthy.Store(false)
+	}
+	session.logger.Info("client session terminated", "reason", reason)
+}
+
+// detachSessionLocked removes a session from every routing index. s.mu must be held.
+func (s *Server) detachSessionLocked(session *serverSession) {
+	if s.sessions[session.id] != session {
+		return
+	}
+	delete(s.sessions, session.id)
+	idText := protocol.ClientIDString(session.credential.clientID)
+	if s.sessionByClient[idText] == session {
+		delete(s.sessionByClient, idText)
+	}
+	if s.sessionByIP[session.credential.tunnelIP] == session {
+		delete(s.sessionByIP, session.credential.tunnelIP)
+	}
+	s.metrics.ActiveSessions.Add(-1)
 }
 
 func (s *Server) handleEncrypted(remote *net.UDPAddr, header protocol.Header, packet []byte) {
@@ -486,7 +538,9 @@ func (s *Server) handleEncrypted(remote *net.UDPAddr, header protocol.Header, pa
 			path.recordWriteError(err)
 		}
 	case protocol.TypeClose:
-		session.removePath(path)
+		if session.removePath(path) {
+			s.terminateSessionIfCurrent(session, "last path closed")
+		}
 	default:
 		s.metrics.InvalidPackets.Add(1)
 	}
@@ -559,7 +613,7 @@ func (s *Server) reorderLoop(ctx context.Context) {
 func (s *Server) deliver(result reorder.Result, logger *slog.Logger) {
 	if result.Skipped > 0 {
 		s.metrics.ReorderSkips.Add(result.Skipped)
-		logger.Warn("reorder deadline skipped missing packets", "count", result.Skipped)
+		logger.Debug("reorder deadline skipped missing packets", "count", result.Skipped)
 	}
 	for _, packet := range result.Packets {
 		if err := s.tun.WritePacket(packet); err != nil {
@@ -627,6 +681,7 @@ func (s *Server) statsLoop(ctx context.Context) {
 				"received_bytes", s.metrics.ReceivedBytes.Load(),
 				"auth_failures", s.metrics.AuthFailures.Load(),
 				"invalid_packets", s.metrics.InvalidPackets.Load(),
+				"reorder_skips", s.metrics.ReorderSkips.Load(),
 			)
 		}
 	}
@@ -634,6 +689,39 @@ func (s *Server) statsLoop(ctx context.Context) {
 
 func (s *serverSession) touch() {
 	s.lastSeen.Store(time.Now().UnixNano())
+}
+
+func (s *serverSession) accepts(hello protocol.Hello) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closing {
+		return false
+	}
+	if s.legacy || hello.WireVersion < 2 {
+		return s.legacy && hello.WireVersion < 2
+	}
+	return bytes.Equal(s.instanceNonce[:], hello.InstanceNonce[:])
+}
+
+func (s *serverSession) addPath(path *serverPath) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closing {
+		return false
+	}
+	s.paths[path.id] = path
+	return true
+}
+
+func (s *serverSession) markClosing() []*serverPath {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.closing = true
+	paths := make([]*serverPath, 0, len(s.paths))
+	for _, path := range s.paths {
+		paths = append(paths, path)
+	}
+	return paths
 }
 
 func (s *serverSession) path(id uint32) *serverPath {
@@ -663,15 +751,20 @@ func (s *serverSession) snapshotPaths() []*serverPath {
 	return paths
 }
 
-func (s *serverSession) removePath(path *serverPath) {
+func (s *serverSession) removePath(path *serverPath) bool {
 	s.mu.Lock()
 	if s.paths[path.id] == path {
 		delete(s.paths, path.id)
+	}
+	empty := len(s.paths) == 0
+	if empty {
+		s.closing = true
 	}
 	s.mu.Unlock()
 	path.healthy.Store(false)
 	path.metric.Healthy.Store(false)
 	path.logger.Info("path closed")
+	return empty
 }
 
 func (s *serverSession) nextPath(now time.Time) *serverPath {

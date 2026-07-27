@@ -2,6 +2,8 @@ package protocol
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/binary"
 	"testing"
 	"time"
 )
@@ -12,7 +14,8 @@ func TestHandshakeAndEncryptedPacket(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	hello, err := NewHello(id, "usb-tether", 3)
+	instanceNonce := [16]byte{1, 2, 3, 4}
+	hello, err := NewHello(id, instanceNonce, "usb-tether", 3)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -24,7 +27,7 @@ func TestHandshakeAndEncryptedPacket(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if parsedHello.PathName != hello.PathName || parsedHello.ClientID != hello.ClientID {
+	if parsedHello.PathName != hello.PathName || parsedHello.ClientID != hello.ClientID || parsedHello.InstanceNonce != instanceNonce || parsedHello.WireVersion != 2 {
 		t.Fatalf("hello mismatch: %#v", parsedHello)
 	}
 
@@ -71,7 +74,7 @@ func TestHandshakeAndEncryptedPacket(t *testing.T) {
 func TestHelloRejectsTamperingAndClockSkew(t *testing.T) {
 	key := bytes.Repeat([]byte{0x11}, 32)
 	var id [16]byte
-	hello, err := NewHello(id, "wifi", 1)
+	hello, err := NewHello(id, [16]byte{1}, "wifi", 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,6 +90,28 @@ func TestHelloRejectsTamperingAndClockSkew(t *testing.T) {
 	payload, _ = hello.Marshal(key)
 	if _, err := ParseHello(payload, key, time.Now()); err != ErrClockSkew {
 		t.Fatalf("clock error = %v, want %v", err, ErrClockSkew)
+	}
+}
+
+func TestParseLegacyHelloDuringRollingUpgrade(t *testing.T) {
+	key := bytes.Repeat([]byte{0x33}, 32)
+	name := "legacy-wifi"
+	payload := make([]byte, helloV1FixedSize+len(name))
+	payload[0] = 7
+	payload[16] = 9
+	binary.BigEndian.PutUint64(payload[32:40], uint64(time.Now().Unix()))
+	binary.BigEndian.PutUint16(payload[40:42], 100)
+	payload[42] = byte(len(name))
+	copy(payload[43:], name)
+	macAt := len(payload) - sha256.Size
+	copy(payload[macAt:], sign(key, []byte("linkforge/hello/v1"), payload[:macAt]))
+
+	hello, err := ParseHello(payload, key, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hello.WireVersion != 1 || hello.InstanceNonce != ([16]byte{}) || hello.PathName != name {
+		t.Fatalf("unexpected legacy hello: %#v", hello)
 	}
 }
 

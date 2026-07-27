@@ -23,11 +23,29 @@ additional authenticated data.
 
 ## Handshake
 
-HELLO contains client ID, 128-bit client nonce, Unix timestamp, a fixed-point
-scheduler weight (configured weight × 100), path-name length/name, and HMAC
-over a domain separator plus fields. The relay looks up
-the client ID, checks the HMAC and ±2 minute clock window, then reuses an
-existing response for a retransmitted nonce.
+The current HELLO v2 payload contains:
+
+| Size | Field |
+|---:|---|
+| 16 | enrolled client ID |
+| 16 | client-process instance nonce, shared by all its paths |
+| 16 | fresh path nonce |
+| 8 | Unix timestamp |
+| 2 | fixed-point scheduler weight (configured weight × 100) |
+| 1 | path-name length |
+| variable | path name, at most 63 bytes |
+| 32 | HMAC-SHA256 using the `linkforge/hello/v2` domain |
+
+The relay looks up the client ID, checks the HMAC and ±2 minute clock window,
+then reuses an existing response for a retransmitted path nonce. Paths with
+the same authenticated instance nonce join one session. A different instance
+nonce for the same client ID atomically replaces the stale session and resets
+global sequence/reorder state. This distinguishes a new client process from a
+second physical path without storing machine-specific state in the profile.
+
+Relays accept the legacy HELLO v1 layout during rolling upgrades. It omitted
+the instance nonce and used the `linkforge/hello/v1` HMAC domain. New clients
+always emit HELLO v2.
 
 WELCOME contains the echoed client nonce, fresh 128-bit server nonce, timestamp,
 and HMAC over its domain separator, header, and fields. Its header assigns the
@@ -69,6 +87,8 @@ sequence restores order across paths.
 
 ## Compatibility policy
 
-Unknown protocol versions fail closed. Any incompatible format change will
-increment the version. New packet types or negotiated flags may be added
-without reusing existing meanings.
+Unknown datagram-header versions fail closed. The HELLO v2 extension is
+unambiguously length-checked and independently authenticated, allowing a relay
+to accept HELLO v1 during migration. Future incompatible header or encrypted
+packet changes will increment the datagram version. New packet types or
+negotiated flags may be added without reusing existing meanings.

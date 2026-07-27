@@ -78,6 +78,14 @@ and a fixed tunnel IP declared on the relay. Each path handshake has fresh
 client/server nonces and derives a unique path key with HKDF-SHA256. Encryption
 nonces combine direction, path ID, and a monotonic per-path sequence.
 
+Each running client process also generates a shared 128-bit instance nonce.
+All of that process's physical paths join one relay session. A later process
+using the same enrolled device ID has a different instance nonce, so the relay
+immediately retires the stale session and resets both global data sequences.
+The last authenticated CLOSE also removes the session immediately. This avoids
+carrying reorder state across diagnostics, crashes, upgrades, or repeated
+Aggregate/Stop cycles.
+
 The cleartext routing header is authenticated as AEAD additional data.
 Per-direction replay windows accept ordinary UDP reordering but reject
 duplicates. The relay updates a NAT-rebound remote address only after a packet

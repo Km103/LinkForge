@@ -169,12 +169,99 @@ func TestDiagnosticUsesEveryPath(t *testing.T) {
 		server.mu.RLock()
 		session := server.sessionByClient[testClientID]
 		server.mu.RUnlock()
-		if session != nil && len(session.snapshotPaths()) == 0 {
+		if session == nil {
 			return
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatal("diagnostic paths were not retired after close")
+}
+
+func TestNewClientProcessReplacesStaleSession(t *testing.T) {
+	address := availableUDPAddress(t)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	serverMetrics := metrics.New("server")
+	server, err := NewServer(config.Server{
+		Listen:         address,
+		TunnelAddress:  "10.77.0.1/24",
+		MTU:            1280,
+		ReorderWindow:  512,
+		SessionTimeout: config.Duration(time.Minute),
+		Clients: []config.ClientCredential{{
+			Name: "restart", ClientID: testClientID, PSK: testKey, TunnelAddress: "10.77.0.2/24",
+		}},
+	}, tun.NewMemory("server-restart", 16), logger, serverMetrics)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go server.Run(ctx)
+	waitReady(t, serverMetrics)
+
+	clientConfig := config.Client{
+		Server: address, ClientID: testClientID, PSK: testKey, TunnelAddress: "10.77.0.2/24",
+		MTU: 1280, ReorderWindow: 512,
+		Paths: []config.Path{{Name: "wifi", LocalAddress: "127.0.0.1", Weight: 1}},
+	}
+	first, err := NewClient(clientConfig, nil, logger, metrics.New("first"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.connect(ctx); err != nil {
+		t.Fatal(err)
+	}
+	server.mu.RLock()
+	firstSession := server.sessionByClient[testClientID]
+	server.mu.RUnlock()
+	if firstSession == nil {
+		t.Fatal("first session was not registered")
+	}
+	firstSession.dataSeq.Store(800)
+	// Simulate a crash: close the socket without sending TypeClose.
+	for _, path := range first.snapshotPaths() {
+		_ = path.conn.Close()
+	}
+
+	second, err := NewClient(clientConfig, nil, logger, metrics.New("second"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.currentInstanceNonce() == second.currentInstanceNonce() {
+		t.Fatal("separate client processes reused an instance identity")
+	}
+	if err := second.connect(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer second.close()
+	server.mu.RLock()
+	secondSession := server.sessionByClient[testClientID]
+	server.mu.RUnlock()
+	if secondSession == nil || secondSession == firstSession || secondSession.id == firstSession.id {
+		t.Fatal("new client process reused the stale relay session")
+	}
+	if got := secondSession.dataSeq.Load(); got != 0 {
+		t.Fatalf("replacement session downlink sequence=%d, want 0", got)
+	}
+}
+
+func TestDiagnosticIgnoresLateTunnelData(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	registry := metrics.New("doctor")
+	client, err := NewClient(config.Client{
+		Server: "127.0.0.1:4430", ClientID: testClientID, PSK: testKey, TunnelAddress: "10.77.0.2/24",
+		MTU: 1280, ReorderWindow: 512,
+	}, nil, logger, registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := &clientPath{logger: logger, metric: registry.Path("wifi")}
+	packet := ipv4Packet([4]byte{1, 1, 1, 1}, [4]byte{10, 77, 0, 2}, 7)
+	payload, err := protocol.MarshalData(1, packet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.handlePacket(path, protocol.TypeData, payload)
 }
 
 func TestManagedCredentialAuthorizationRotationAndRevocation(t *testing.T) {
@@ -206,7 +293,7 @@ func TestManagedCredentialAuthorizationRotationAndRevocation(t *testing.T) {
 	if !ok {
 		t.Fatal("managed credential was not installed")
 	}
-	if _, err := server.getOrCreateSession(current); err != nil {
+	if _, err := server.getOrCreateSession(current, protocol.Hello{InstanceNonce: [16]byte{1}, WireVersion: 2}); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := server.sessionByClient[testClientID]; !ok {

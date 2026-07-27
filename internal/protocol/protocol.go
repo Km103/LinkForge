@@ -23,15 +23,16 @@ import (
 )
 
 const (
-	Version        = 1
-	HeaderSize     = 28
-	TagSize        = 16
-	MaxDatagram    = 64 * 1024
-	MaxPayload     = MaxDatagram - HeaderSize - TagSize
-	MaxDataPayload = MaxPayload - 8
-	HandshakeSkew  = 2 * time.Minute
-	helloFixedSize = 16 + 16 + 8 + 2 + 1 + 32
-	welcomeSize    = 16 + 16 + 8 + 32
+	Version          = 1
+	HeaderSize       = 28
+	TagSize          = 16
+	MaxDatagram      = 64 * 1024
+	MaxPayload       = MaxDatagram - HeaderSize - TagSize
+	MaxDataPayload   = MaxPayload - 8
+	HandshakeSkew    = 2 * time.Minute
+	helloV1FixedSize = 16 + 16 + 8 + 2 + 1 + 32
+	helloV2FixedSize = 16 + 16 + 16 + 8 + 2 + 1 + 32
+	welcomeSize      = 16 + 16 + 8 + 32
 )
 
 var (
@@ -106,22 +107,34 @@ func IsHandshake(t Type) bool {
 }
 
 type Hello struct {
-	ClientID [16]byte
-	Nonce    [16]byte
-	Time     time.Time
-	PathName string
-	Weight   uint16
+	ClientID      [16]byte
+	InstanceNonce [16]byte
+	Nonce         [16]byte
+	Time          time.Time
+	PathName      string
+	Weight        uint16
+	WireVersion   uint8
 }
 
-func NewHello(clientID [16]byte, pathName string, weight float64) (Hello, error) {
+func NewHello(clientID, instanceNonce [16]byte, pathName string, weight float64) (Hello, error) {
 	if len(pathName) > 63 {
 		return Hello{}, fmt.Errorf("path name must be at most 63 bytes")
+	}
+	if instanceNonce == ([16]byte{}) {
+		return Hello{}, errors.New("client instance nonce must not be empty")
 	}
 	wireWeight := uint16(weight*100 + 0.5)
 	if wireWeight == 0 {
 		wireWeight = 100
 	}
-	h := Hello{ClientID: clientID, Time: time.Now().UTC(), PathName: pathName, Weight: wireWeight}
+	h := Hello{
+		ClientID:      clientID,
+		InstanceNonce: instanceNonce,
+		Time:          time.Now().UTC(),
+		PathName:      pathName,
+		Weight:        wireWeight,
+		WireVersion:   2,
+	}
 	if _, err := rand.Read(h.Nonce[:]); err != nil {
 		return Hello{}, fmt.Errorf("create handshake nonce: %w", err)
 	}
@@ -132,24 +145,53 @@ func (h Hello) Marshal(key []byte) ([]byte, error) {
 	if len(h.PathName) > 63 {
 		return nil, fmt.Errorf("path name must be at most 63 bytes")
 	}
-	b := make([]byte, helloFixedSize+len(h.PathName))
+	if h.InstanceNonce == ([16]byte{}) {
+		return nil, errors.New("client instance nonce must not be empty")
+	}
+	b := make([]byte, helloV2FixedSize+len(h.PathName))
 	copy(b[0:16], h.ClientID[:])
-	copy(b[16:32], h.Nonce[:])
-	binary.BigEndian.PutUint64(b[32:40], uint64(h.Time.Unix()))
-	binary.BigEndian.PutUint16(b[40:42], h.Weight)
-	b[42] = byte(len(h.PathName))
-	copy(b[43:43+len(h.PathName)], h.PathName)
+	copy(b[16:32], h.InstanceNonce[:])
+	copy(b[32:48], h.Nonce[:])
+	binary.BigEndian.PutUint64(b[48:56], uint64(h.Time.Unix()))
+	binary.BigEndian.PutUint16(b[56:58], h.Weight)
+	b[58] = byte(len(h.PathName))
+	copy(b[59:59+len(h.PathName)], h.PathName)
 	macAt := len(b) - sha256.Size
-	copy(b[macAt:], sign(key, []byte("linkforge/hello/v1"), b[:macAt]))
+	copy(b[macAt:], sign(key, []byte("linkforge/hello/v2"), b[:macAt]))
 	return b, nil
 }
 
 func ParseHello(b, key []byte, now time.Time) (Hello, error) {
-	if len(b) < helloFixedSize {
+	if len(b) >= helloV2FixedSize {
+		nameLen := int(b[58])
+		if len(b) == helloV2FixedSize+nameLen {
+			macAt := len(b) - sha256.Size
+			expected := sign(key, []byte("linkforge/hello/v2"), b[:macAt])
+			if !hmac.Equal(expected, b[macAt:]) {
+				return Hello{}, ErrAuth
+			}
+			var h Hello
+			copy(h.ClientID[:], b[0:16])
+			copy(h.InstanceNonce[:], b[16:32])
+			copy(h.Nonce[:], b[32:48])
+			h.Time = time.Unix(int64(binary.BigEndian.Uint64(b[48:56])), 0).UTC()
+			h.Weight = binary.BigEndian.Uint16(b[56:58])
+			h.PathName = string(b[59:macAt])
+			h.WireVersion = 2
+			if h.InstanceNonce == ([16]byte{}) || h.Weight == 0 {
+				return Hello{}, ErrBadPacket
+			}
+			if delta := now.Sub(h.Time); delta > HandshakeSkew || delta < -HandshakeSkew {
+				return Hello{}, ErrClockSkew
+			}
+			return h, nil
+		}
+	}
+	if len(b) < helloV1FixedSize {
 		return Hello{}, ErrBadPacket
 	}
 	nameLen := int(b[42])
-	if len(b) != helloFixedSize+nameLen {
+	if len(b) != helloV1FixedSize+nameLen {
 		return Hello{}, ErrBadPacket
 	}
 	macAt := len(b) - sha256.Size
@@ -166,6 +208,7 @@ func ParseHello(b, key []byte, now time.Time) (Hello, error) {
 		return Hello{}, ErrBadPacket
 	}
 	h.PathName = string(b[43:macAt])
+	h.WireVersion = 1
 	if delta := now.Sub(h.Time); delta > HandshakeSkew || delta < -HandshakeSkew {
 		return Hello{}, ErrClockSkew
 	}

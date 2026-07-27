@@ -136,6 +136,7 @@ split-route configurations.
 - [Linux relay deployment](docs/deploy-linux.md)
 - [Windows client guide](docs/windows.md)
 - [Operations and verification](docs/operations.md)
+- [Performance testing](docs/performance-testing.md)
 - [Wire protocol](docs/protocol.md)
 - [Security policy](SECURITY.md)
 

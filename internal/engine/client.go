@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"crypto/cipher"
+	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -38,9 +39,11 @@ type Client struct {
 	sessionID atomic.Uint64
 	rejoining atomic.Bool
 
-	mu        sync.RWMutex
-	deliverMu sync.Mutex
-	paths     []*clientPath
+	mu            sync.RWMutex
+	deliverMu     sync.Mutex
+	instanceMu    sync.RWMutex
+	instanceNonce [16]byte
+	paths         []*clientPath
 }
 
 type clientPath struct {
@@ -97,17 +100,22 @@ func NewClient(c config.Client, device tun.Device, logger *slog.Logger, registry
 	if registry == nil {
 		registry = metrics.New("client")
 	}
+	var instanceNonce [16]byte
+	if _, err := rand.Read(instanceNonce[:]); err != nil {
+		return nil, fmt.Errorf("create client instance nonce: %w", err)
+	}
 	return &Client{
-		config:    c,
-		logger:    logger,
-		metrics:   registry,
-		tun:       device,
-		key:       key,
-		clientID:  clientID,
-		tunnelIP:  prefix.Addr(),
-		remote:    remote,
-		scheduler: scheduler.New(),
-		reorder:   reorder.New(c.ReorderWindow, c.ReorderDelay.Value(80*time.Millisecond)),
+		config:        c,
+		logger:        logger,
+		metrics:       registry,
+		tun:           device,
+		key:           key,
+		clientID:      clientID,
+		tunnelIP:      prefix.Addr(),
+		remote:        remote,
+		scheduler:     scheduler.New(),
+		reorder:       reorder.New(c.ReorderWindow, c.ReorderDelay.Value(80*time.Millisecond)),
+		instanceNonce: instanceNonce,
 	}, nil
 }
 
@@ -239,6 +247,7 @@ func (c *Client) connectPath(ctx context.Context, pathConfig config.Path) (*clie
 	if err != nil {
 		return nil, pathError{pathConfig.Name, fmt.Errorf("open UDP socket: %w", err)}
 	}
+	tuneUDPSocket(conn, c.logger.With("path", pathConfig.Name))
 	closeOnError := true
 	defer func() {
 		if closeOnError {
@@ -246,7 +255,7 @@ func (c *Client) connectPath(ctx context.Context, pathConfig config.Path) (*clie
 		}
 	}()
 
-	hello, err := protocol.NewHello(c.clientID, pathConfig.Name, pathConfig.Weight)
+	hello, err := protocol.NewHello(c.clientID, c.currentInstanceNonce(), pathConfig.Name, pathConfig.Weight)
 	if err != nil {
 		return nil, pathError{pathConfig.Name, err}
 	}
@@ -413,6 +422,10 @@ func (c *Client) handlePacket(path *clientPath, packetType protocol.Type, payloa
 			path.logger.Debug("dropped packet with unexpected tunnel destination", "destination", destination, "error", err)
 			return
 		}
+		if c.tun == nil {
+			path.logger.Debug("ignored tunnel data while running diagnostics")
+			return
+		}
 		c.deliverMu.Lock()
 		c.deliver(c.reorder.Push(sequence, ipPacket, time.Now()), path.logger)
 		c.deliverMu.Unlock()
@@ -457,7 +470,10 @@ func (c *Client) reorderLoop(ctx context.Context) {
 func (c *Client) deliver(result reorder.Result, logger *slog.Logger) {
 	if result.Skipped > 0 {
 		c.metrics.ReorderSkips.Add(result.Skipped)
-		logger.Warn("reorder deadline skipped missing packets", "count", result.Skipped)
+		logger.Debug("reorder deadline skipped missing packets", "count", result.Skipped)
+	}
+	if c.tun == nil {
+		return
 	}
 	for _, packet := range result.Packets {
 		if err := c.tun.WritePacket(packet); err != nil {
@@ -564,6 +580,11 @@ func (c *Client) rejoinAll(ctx context.Context) {
 	c.paths = nil
 	c.mu.Unlock()
 	c.deliverMu.Lock()
+	if err := c.rotateInstanceNonce(); err != nil {
+		c.deliverMu.Unlock()
+		c.logger.Error("could not create a new relay session identity", "error", err)
+		return
+	}
 	c.reorder.Reset()
 	c.dataSeq.Store(0)
 	c.sessionID.Store(0)
@@ -575,6 +596,23 @@ func (c *Client) rejoinAll(ctx context.Context) {
 	}
 	c.startReceivers(ctx, c.snapshotPaths())
 	c.logger.Info("relay session rejoined", "session_id", c.sessionID.Load())
+}
+
+func (c *Client) currentInstanceNonce() [16]byte {
+	c.instanceMu.RLock()
+	defer c.instanceMu.RUnlock()
+	return c.instanceNonce
+}
+
+func (c *Client) rotateInstanceNonce() error {
+	var nonce [16]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return err
+	}
+	c.instanceMu.Lock()
+	c.instanceNonce = nonce
+	c.instanceMu.Unlock()
+	return nil
 }
 
 func (c *Client) statsLoop(ctx context.Context) {
@@ -605,6 +643,7 @@ func (c *Client) statsLoop(ctx context.Context) {
 				"sent_bytes", c.metrics.SentBytes.Load(),
 				"received_bytes", c.metrics.ReceivedBytes.Load(),
 				"no_path_drops", c.metrics.NoPathDrops.Load(),
+				"reorder_skips", c.metrics.ReorderSkips.Load(),
 			)
 		}
 	}

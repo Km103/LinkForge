@@ -46,7 +46,8 @@ collector. Important events include:
 - `path unhealthy` / `path recovered`: failover evidence;
 - `path statistics`: per-path RTT, bytes, and write errors;
 - `tunnel statistics` / `relay statistics`: aggregate counters;
-- `reorder deadline skipped missing packets`: gap count;
+- `reorder deadline skipped missing packets` at debug level: individual gap;
+- `tunnel statistics` / `relay statistics`: cumulative `reorder_skips` count;
 - `spoofed tunnel packet dropped`: assigned-IP violation.
 
 Example journal query:
